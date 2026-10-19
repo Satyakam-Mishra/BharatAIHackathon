@@ -1,0 +1,55 @@
+# ==========================================
+# macOS & System Files
+# ==========================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ==========================================
+# Python & Virtual Environments
+# ==========================================
+pcb_env/
+venv/
+.venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# ==========================================
+# IDE & Editor Configs
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ==========================================
+# Datasets (Downloaded locally)
+# ==========================================
+PCB_DATASET/
+PCB-Defects-Detection-1/
+*.zip
+*.tar.gz
+*.csv
+
+# ==========================================
+# Model Weights & Exported Binaries
+# (Prevents pushing heavy model files to Git)
+# ==========================================
+runs/
+*.pt
+*.onnx
+*.engine
+*.pte
+*.bin
+*.safetensors
+*.gguf
+*.ckpt

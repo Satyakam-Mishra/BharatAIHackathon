@@ -1,0 +1,11 @@
+torch 
+torchvision 
+torchaudio
+ultralytics 
+opencv-python 
+pillow 
+roboflow
+torchao 
+transformers 
+sentencepiece 
+huggingface_hub

@@ -35,3 +35,5 @@ The system should operate in real time on edge devices without cloud dependence.
 
 **Adithya Kumar**
 
+## Dataset usage 
+Peking University PCB Defect Dataset
