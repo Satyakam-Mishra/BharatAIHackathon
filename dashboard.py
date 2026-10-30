@@ -6,6 +6,7 @@ import pandas as pd
 from PIL import Image
 from ultralytics import YOLO
 from hardware_logger import init_db, get_hardware_metrics, log_inspection
+from llm_engine import get_advisory_recommendation
 
 st.set_page_config(page_title="Edge AI PCB Quality Control", layout="wide")
 init_db()
@@ -61,10 +62,8 @@ with left_col:
                 })
                 
         # Trigger Llama Advisory (Placeholder until CSE links .pte binary)
-        if detections:
-            advice = f"⚠️ Found {len(detections)} issue(s) ({detections[0]['defect']}). Inspect trace continuity and clear copper bridges before soldering."
-        else:
-            advice = "✅ Component Nominal. Proceed to next assembly stage."
+        # Trigger Llama Advisory via llm_engine.py
+        advice = get_advisory_recommendation(detections)
             
         log_inspection(detections, advice)
         st.session_state["last_advice"] = advice
