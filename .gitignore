@@ -53,3 +53,4 @@ runs/
 *.safetensors
 *.gguf
 *.ckpt
+*.db
