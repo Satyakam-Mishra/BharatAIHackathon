@@ -8,8 +8,8 @@ What happens here, in order:
   3. Llama 3.2 1B, running on ExecuTorch in its own Python environment, writes
      the instruction for the operator: what to do and where, most severe defect
      first (see llama_runner.py).
-  4. Llama's instruction is checked. If it is cut off, leaves out a defect that
-     was found or names a defect that was not found, or if Llama is not installed
+  4. Llama's instruction is checked. If it is cut off, leaves out a defect or a
+     location that was found, or names a defect that was not found, or if Llama is not installed
      on this computer, a plain rule-based instruction is shown instead and it is
      labelled as such.
 """
@@ -152,6 +152,21 @@ def group_findings(findings):
     return [(defect, severity, g["count"], g["places"]) for (defect, severity), g in ordered]
 
 
+def group_by_type(findings):
+    """Groups defects by type only, for the operator instruction.
+
+    One defect type needs one action however its members were graded, so all of
+    its locations go on one line. Returns a list of (defect, highest severity,
+    count, places), most severe type first, most severe locations first.
+    """
+    groups = {}
+    for defect, severity, count, places in group_findings(findings):      # already most severe first
+        g = groups.setdefault(defect, {"severity": severity, "count": 0, "places": []})
+        g["count"] += count
+        g["places"] += [p for p in places if p not in g["places"]]
+    return [(defect, g["severity"], g["count"], g["places"]) for defect, g in groups.items()]
+
+
 def _join(words):
     """['a', 'b', 'c'] -> 'a, b and c'"""
     return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
@@ -166,9 +181,9 @@ def summary_line(findings):
 
 
 def build_user_prompt(findings):
-    """Writes each group of defects on one line together with its standard action."""
+    """Writes each defect type on one line together with its locations and standard action."""
     lines = []
-    for defect, severity, count, places in group_findings(findings):
+    for defect, severity, count, places in group_by_type(findings):
         action = DEFECT_ACTIONS.get(defect, UNKNOWN_ACTION)
         lines.append(f"- {count} {defect}, severity {severity}, at {_join(places)}. Standard action: {action}.")
     return "\n".join(lines)
@@ -177,7 +192,7 @@ def build_user_prompt(findings):
 def rule_based_action(findings):
     """The operator instruction written without a language model."""
     sentences = ["Hold this board."]
-    for defect, _, count, places in group_findings(findings):
+    for defect, _, count, places in group_by_type(findings):
         action = DEFECT_ACTIONS.get(defect, UNKNOWN_ACTION)
         what = f"the {defect}" if count == 1 else f"the {count} {defect} defects"
         sentences.append(f"For {what} at {_join(places)}, {action}.")
@@ -201,9 +216,17 @@ def check_action(answer, findings):
     found_types = {f["defect"] for f in findings}
     mentioned = {name for name, pattern in DEFECT_PATTERNS.items() if pattern.search(text)}
     # Every defect type that was found must be named, so nothing is silently skipped...
-    left_out = [d for d, _, _, _ in group_findings(findings) if d in DEFECT_PATTERNS and d not in mentioned]
+    groups = group_by_type(findings)
+    left_out = [d for d, _, _, _ in groups if d in DEFECT_PATTERNS and d not in mentioned]
     if left_out:
         raise RuntimeError(f"Llama's answer left out a defect that was found ({', '.join(left_out)})")
+    # ...every location must be named too, so the operator knows where to look
+    # ("top-right" may be written "top right")...
+    all_places = [p for _, _, _, places in groups for p in places]
+    missing_places = [p for p in dict.fromkeys(all_places)
+                      if not re.search(r"\b" + p.replace("-", "[ -]?") + r"\b", text, re.IGNORECASE)]
+    if missing_places:
+        raise RuntimeError(f"Llama's answer left out a location ({', '.join(missing_places)})")
     # ...and no defect type may be named that was not found.
     invented = sorted(mentioned - found_types)
     if invented:
@@ -278,7 +301,7 @@ def advise(findings):
 
 if __name__ == "__main__":
     # Quick test without the dashboard:  python3 llm_engine.py
-    # Three different boards, to see how Llama copes with each.
+    # Four different boards, to see how Llama copes with each.
     SIZE = (3034, 1586)
     cases = {
         "A: three spurs": [
@@ -295,6 +318,11 @@ if __name__ == "__main__":
             {"defect": "open_circuit", "confidence": 0.83, "box": [300, 700, 360, 740]},
             {"defect": "spurious_copper", "confidence": 0.77, "box": [2000, 1100, 2120, 1180]},
             {"defect": "mouse_bite", "confidence": 0.69, "box": [1500, 200, 1550, 250]},
+        ],
+        "D: three spurious copper patches, one small and two large": [
+            {"defect": "spurious_copper", "confidence": 0.74, "box": [2300, 300, 2340, 388]},
+            {"defect": "spurious_copper", "confidence": 0.75, "box": [2400, 700, 2440, 803]},
+            {"defect": "spurious_copper", "confidence": 0.78, "box": [1500, 780, 1621, 810]},
         ],
     }
     for name, detections in cases.items():
