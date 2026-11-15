@@ -1,4 +1,3 @@
-import os
 import sqlite3
 import time
 
@@ -7,20 +6,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
-from ultralytics import YOLO
 
+import vision
 from hardware_logger import init_db, get_hardware_metrics, log_inspection
 from llm_engine import get_advisory_recommendation
 
-# ---------------------------------------------------------------------------
-# Settings (change these in one place)
-# ---------------------------------------------------------------------------
-PCB_MODEL = "yolo_pcb.onnx"       # our fine-tuned PCB defect model (from Colab)
-FALLBACK_MODEL = "yolov8n.onnx"   # stock model, only for testing the pipeline
-CONF_THRESHOLD = 0.30             # ignore detections the model is less than 30% sure about
-CAMERA_INDEX = 0                  # 0 = first camera plugged into this computer
 SOURCE_CAMERA = "Camera on this device"
 SOURCE_UPLOAD = "Upload an image"
+DISPLAY_WIDTH = 1400              # shrink very large photos to this width before showing them
 
 st.set_page_config(page_title="Edge AI PCB Quality Control", layout="wide")
 init_db()
@@ -29,62 +22,37 @@ init_db()
 @st.cache_resource
 def load_vision_model():
     """Loads the YOLO model once and keeps it in memory between page reruns."""
-    path = PCB_MODEL if os.path.exists(PCB_MODEL) else FALLBACK_MODEL
-    return YOLO(path, task="detect"), path
+    return vision.load_model()
 
 
-def capture_frame():
-    """Takes one picture from the USB camera of the computer running this app.
-
-    On the Raspberry Pi this is the webcam plugged into the Pi, not the camera
-    of the laptop that is only showing the web page.
-    Returns the picture in OpenCV's BGR colour order, or None if it failed.
-    """
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        return None
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    # The first few frames are often dark while the camera adjusts its exposure,
-    # so we read and throw away five frames before keeping one.
-    for _ in range(5):
-        cap.read()
-    ok, frame = cap.read()
-    cap.release()
-    return frame if ok else None
-
-
-def run_inspection(frame_bgr):
+def run_inspection(frame_bgr, zoom):
     """Runs one full inspection: vision -> advisory -> log. Stores the result for display."""
-    # 1. Vision: find the defects
+    # 1. Vision: find the defects (see vision.py)
+    found = vision.detect(model, frame_bgr, use_tiles=is_pcb_model, zoom=zoom)
+    detections = found["detections"]
+
+    # 2. Advisory: turn the findings into operator advice (see llm_engine.py)
     t0 = time.perf_counter()
-    results = model(frame_bgr, conf=CONF_THRESHOLD, verbose=False)
-    vision_ms = (time.perf_counter() - t0) * 1000
-
-    detections = []
-    for box in results[0].boxes:
-        x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-        detections.append({
-            "defect": model.names[int(box.cls[0])],
-            "confidence": round(float(box.conf[0]), 2),
-            "box": [x1, y1, x2, y2],
-        })
-
-    # 2. Advisory: turn the findings into operator advice
-    t1 = time.perf_counter()
     advice = get_advisory_recommendation(detections)
-    advice_ms = (time.perf_counter() - t1) * 1000
+    advice_ms = (time.perf_counter() - t0) * 1000
 
     # 3. Log: one row per inspection
     log_inspection(detections, advice)
 
+    # Prepare the picture for the browser: shrink it if it is huge, and convert
+    # OpenCV's BGR colour order to the RGB order that browsers expect.
+    picture = found["annotated_bgr"]
+    if picture.shape[1] > DISPLAY_WIDTH:
+        scale = DISPLAY_WIDTH / picture.shape[1]
+        picture = cv2.resize(picture, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
     # Keep the result so it stays on screen when Streamlit reruns the script.
-    # plot() draws the boxes and returns BGR, so we convert to RGB for the browser.
     st.session_state["last_result"] = {
-        "image_rgb": cv2.cvtColor(results[0].plot(), cv2.COLOR_BGR2RGB),
+        "image_rgb": cv2.cvtColor(picture, cv2.COLOR_BGR2RGB),
         "detections": detections,
         "advice": advice,
-        "vision_ms": vision_ms,
+        "vision_ms": found["vision_ms"],
+        "tiles": found["tiles"],
         "advice_ms": advice_ms,
     }
 
@@ -103,12 +71,13 @@ def show_telemetry():
 # Page layout
 # ---------------------------------------------------------------------------
 model, model_path = load_vision_model()
+is_pcb_model = model_path == vision.PCB_MODEL
 
 st.title("🔧 On-Device PCB Visual Inspection Assistant")
 show_telemetry()
-if model_path == FALLBACK_MODEL:
+if not is_pcb_model:
     st.warning(
-        f"'{PCB_MODEL}' was not found, so the stock test model is loaded. "
+        f"'{vision.PCB_MODEL}' was not found, so the stock test model is loaded. "
         "It recognises everyday objects, not PCB defects."
     )
 st.divider()
@@ -118,6 +87,11 @@ left_col, right_col = st.columns([1.2, 1])
 with left_col:
     st.subheader("📸 PCB Input")
     source = st.radio("Select input source:", [SOURCE_CAMERA, SOURCE_UPLOAD], horizontal=True)
+    zoom = st.slider(
+        "Zoom before inspection", 1.0, 3.0, 1.0, 0.5,
+        help="Enlarges the picture before it is cut into tiles. Leave at 1.0 for the full-size "
+             "dataset photos. Raise it when the camera is far from the board and defects look tiny.",
+    )
 
     # new_frame stays None unless a NEW picture arrives in this run.
     # This is what stops the same picture being inspected and logged again
@@ -126,7 +100,7 @@ with left_col:
 
     if source == SOURCE_CAMERA:
         if st.button("Capture and inspect", type="primary"):
-            new_frame = capture_frame()
+            new_frame = vision.capture_frame()
             if new_frame is None:
                 st.error("Could not read from the camera. Check that it is plugged in.")
     else:
@@ -140,14 +114,14 @@ with left_col:
 
     if new_frame is not None:
         with st.spinner("Inspecting..."):
-            run_inspection(new_frame)
+            run_inspection(new_frame, zoom)
 
     last = st.session_state.get("last_result")
     if last:
-        st.image(last["image_rgb"], caption="Detection overlay")
+        st.image(last["image_rgb"], caption="Detection overlay", output_format="JPEG")
         st.caption(
-            f"Vision: {last['vision_ms']:.0f} ms  |  Advisory: {last['advice_ms']:.0f} ms  |  "
-            f"Model: {model_path}"
+            f"Vision: {last['vision_ms']:.0f} ms over {last['tiles']} tile(s)  |  "
+            f"Advisory: {last['advice_ms']:.0f} ms  |  Model: {model_path}"
         )
 
 with right_col:
@@ -158,7 +132,7 @@ with right_col:
         else:
             st.success("PASS: no defects found")
         st.info(last["advice"])
-        st.json(last["detections"])
+        st.json(last["detections"], expanded=False)
     else:
         st.write("Awaiting PCB scan...")
 
