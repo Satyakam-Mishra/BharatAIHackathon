@@ -8,8 +8,8 @@ What happens here, in order:
   3. Llama 3.2 1B, running on ExecuTorch in its own Python environment, writes
      the instruction for the operator: what to do and where, most severe defect
      first (see llama_runner.py).
-  4. Llama's instruction is checked. If it is cut off, leaves out the most severe
-     defect or names a defect that was not found, or if Llama is not installed
+  4. Llama's instruction is checked. If it is cut off, leaves out a defect that
+     was found or names a defect that was not found, or if Llama is not installed
      on this computer, a plain rule-based instruction is shown instead and it is
      labelled as such.
 """
@@ -61,9 +61,12 @@ DEFECT_ACTIONS = {
 }
 UNKNOWN_ACTION = "send the board for manual inspection"
 
-# How each defect type may be written in a sentence (with a space or an underscore).
+# How each defect type may be written in a sentence: with a space, hyphen or
+# underscore, and in the singular or plural ("missing_hole", "missing holes").
 # \b marks a word boundary, so "spur" does not match inside "spurious".
-DEFECT_PATTERNS = {name: re.compile(r"\b" + name.replace("_", "[ _]") + r"\b", re.IGNORECASE) for name in DEFECT_ACTIONS}
+DEFECT_PATTERNS = {
+    name: re.compile(r"\b" + name.replace("_", "[ _-]") + r"s?\b", re.IGNORECASE) for name in DEFECT_ACTIONS
+}
 
 SYSTEM_PROMPT = (
     "You write the instruction an operator sees when a bare PCB fails inspection. "
@@ -197,9 +200,11 @@ def check_action(answer, findings):
 
     found_types = {f["defect"] for f in findings}
     mentioned = {name for name, pattern in DEFECT_PATTERNS.items() if pattern.search(text)}
-    most_severe = group_findings(findings)[0][0]
-    if most_severe in DEFECT_PATTERNS and most_severe not in mentioned:
-        raise RuntimeError(f"Llama's answer left out the most severe defect ({most_severe})")
+    # Every defect type that was found must be named, so nothing is silently skipped...
+    left_out = [d for d, _, _, _ in group_findings(findings) if d in DEFECT_PATTERNS and d not in mentioned]
+    if left_out:
+        raise RuntimeError(f"Llama's answer left out a defect that was found ({', '.join(left_out)})")
+    # ...and no defect type may be named that was not found.
     invented = sorted(mentioned - found_types)
     if invented:
         raise RuntimeError(f"Llama's answer named a defect that was not found ({', '.join(invented)})")
