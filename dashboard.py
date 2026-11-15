@@ -124,8 +124,10 @@ with left_col:
 
     # The last picture is kept, so it can be inspected again after moving the zoom
     # slider without capturing or uploading it a second time.
-    if st.session_state.get("last_frame") is not None:
-        if st.button("Inspect the same picture again with this zoom"):
+    # The button is shown as soon as there is a picture, including the one that
+    # arrived in this very run.
+    if new_frame is not None or st.session_state.get("last_frame") is not None:
+        if st.button("Inspect the same picture again with this zoom") and new_frame is None:
             new_frame = st.session_state["last_frame"]
 
     if new_frame is not None:
