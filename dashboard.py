@@ -51,6 +51,7 @@ def run_vision(frame_bgr, zoom):
         "findings": findings,
         "vision_ms": found["vision_ms"],
         "tiles": found["tiles"],
+        "zoom": zoom,
         "advice": None,
         "advice_ms": None,
     }
@@ -121,14 +122,23 @@ with left_col:
             rgb = np.array(Image.open(uploaded).convert("RGB"))
             new_frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)   # YOLO expects BGR arrays
 
+    # The last picture is kept, so it can be inspected again after moving the zoom
+    # slider without capturing or uploading it a second time.
+    if st.session_state.get("last_frame") is not None:
+        if st.button("Inspect the same picture again with this zoom"):
+            new_frame = st.session_state["last_frame"]
+
     if new_frame is not None:
+        st.session_state["last_frame"] = new_frame
         with st.spinner("Inspecting..."):
             run_vision(new_frame, zoom)
 
     last = st.session_state.get("last_result")
     if last:
         st.image(last["image_rgb"], caption="Detection overlay", output_format="JPEG")
-        st.caption(f"Vision: {last['vision_ms']:.0f} ms over {last['tiles']} tile(s)  |  Model: {model_path}")
+        st.caption(
+            f"Vision: {last['vision_ms']:.0f} ms over {last['tiles']} tile(s) at zoom {last['zoom']}  |  Model: {model_path}"
+        )
 
 with right_col:
     st.subheader("🤖 Operator Advisory")
