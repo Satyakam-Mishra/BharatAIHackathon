@@ -35,22 +35,31 @@ TEST_USER = (
 )
 
 
-def build_chat_prompt(system_text, user_text):
+def build_chat_prompt(system_text, user_text, examples=None, assistant_prefix=""):
     """Wraps the text in the special markers Llama 3 Instruct models were trained with.
 
     Without these markers the model does not know where the instructions end and
     where its own answer should begin.
+
+    examples         : optional list of [question, ideal answer] pairs shown to the model
+                       before the real question, so it copies the answer format.
+    assistant_prefix : optional words that the answer must start with. The model
+                       continues from them, which keeps it in the expected format.
     """
-    return (
-        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-        f"{system_text}<|eot_id|>"
-        "<|start_header_id|>user<|end_header_id|>\n\n"
-        f"{user_text}<|eot_id|>"
-        "<|start_header_id|>assistant<|end_header_id|>\n\n"
-    )
+    def turn(role, text):
+        return f"<|start_header_id|>{role}<|end_header_id|>\n\n{text}<|eot_id|>"
+
+    prompt = "<|begin_of_text|>" + turn("system", system_text)
+    for example_user, example_answer in examples or []:
+        prompt += turn("user", example_user) + turn("assistant", example_answer)
+    prompt += turn("user", user_text)
+    # The last assistant turn is left open (no <|eot_id|>) so the model writes it.
+    prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n" + assistant_prefix
+    return prompt
 
 
-def generate(system_text, user_text, model_path, tokenizer_path, max_new_tokens=160):
+def generate(system_text, user_text, model_path, tokenizer_path, max_new_tokens=160,
+             examples=None, assistant_prefix=""):
     """Loads the model, generates one answer and returns it with timing numbers."""
     # These two imports register extra operators that the exported model uses
     # (the fast attention operator and the 4-bit lookup table).
@@ -82,7 +91,8 @@ def generate(system_text, user_text, model_path, tokenizer_path, max_new_tokens=
         stats["time_to_first_token_ms"] = s.first_token_ms - s.inference_start_ms
         stats["generation_ms"] = s.inference_end_ms - s.first_token_ms
 
-    runner.generate(build_chat_prompt(system_text, user_text), config, on_token, on_stats)
+    prompt = build_chat_prompt(system_text, user_text, examples, assistant_prefix)
+    runner.generate(prompt, config, on_token, on_stats)
     total_ms = (time.perf_counter() - t_start) * 1000
 
     text = "".join(pieces)
@@ -125,6 +135,8 @@ def main():
     result = generate(
         request["system"], request["user"], model_path, tokenizer_path,
         max_new_tokens=int(request.get("max_new_tokens", 160)),
+        examples=request.get("examples"),
+        assistant_prefix=request.get("assistant_prefix", ""),
     )
     # Start on a fresh line so the marker is easy to find among the runner's own output.
     print("\n" + RESULT_MARKER + json.dumps(result), flush=True)
