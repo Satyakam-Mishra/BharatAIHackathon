@@ -5,7 +5,7 @@ not the dashboard's environment. It has nothing to do with the vision model.
 
 Two ways to use it:
 
-  1. Quick test from the terminal (prints the answer as it is generated, then the speed):
+  1. Quick test from the terminal (prints ExecuTorch's log, then the answer and the speed):
          ~/et_env/bin/python llama_runner.py --test
 
   2. Called by the dashboard (llm_engine.py): it reads a JSON request from standard
@@ -50,7 +50,7 @@ def build_chat_prompt(system_text, user_text):
     )
 
 
-def generate(system_text, user_text, model_path, tokenizer_path, max_new_tokens=160, stream=False):
+def generate(system_text, user_text, model_path, tokenizer_path, max_new_tokens=160):
     """Loads the model, generates one answer and returns it with timing numbers."""
     # These two imports register extra operators that the exported model uses
     # (the fast attention operator and the 4-bit lookup table).
@@ -71,9 +71,9 @@ def generate(system_text, user_text, model_path, tokenizer_path, max_new_tokens=
     stats = {}
 
     def on_token(text):
+        # The ExecuTorch runner prints each piece itself as it is generated,
+        # so here we only collect the pieces to build the clean answer.
         pieces.append(text)
-        if stream:
-            print(text, end="", flush=True)
 
     def on_stats(s):
         # Copy the numbers out now; the object is only valid during this call.
@@ -112,9 +112,11 @@ def main():
             sys.exit(f"File not found: {path}")
 
     if args.test:
-        print(f"Model: {model_path}\nTokenizer: {tokenizer_path}\n\n--- Answer ---")
-        result = generate(TEST_SYSTEM, TEST_USER, model_path, tokenizer_path, stream=True)
-        print("\n\n--- Speed ---")
+        print(f"Model: {model_path}\nTokenizer: {tokenizer_path}\n\n--- ExecuTorch log ---")
+        result = generate(TEST_SYSTEM, TEST_USER, model_path, tokenizer_path)
+        print("\n--- Answer ---")
+        print(result["text"])
+        print("\n--- Speed ---")
         for key, value in result["stats"].items():
             print(f"{key:32s} {value}")
         return
@@ -124,7 +126,8 @@ def main():
         request["system"], request["user"], model_path, tokenizer_path,
         max_new_tokens=int(request.get("max_new_tokens", 160)),
     )
-    print(RESULT_MARKER + json.dumps(result), flush=True)
+    # Start on a fresh line so the marker is easy to find among the runner's own output.
+    print("\n" + RESULT_MARKER + json.dumps(result), flush=True)
 
 
 if __name__ == "__main__":

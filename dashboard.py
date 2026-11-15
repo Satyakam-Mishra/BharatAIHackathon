@@ -7,9 +7,9 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
+import llm_engine
 import vision
 from hardware_logger import init_db, get_hardware_metrics, log_inspection
-from llm_engine import get_advisory_recommendation
 
 SOURCE_CAMERA = "Camera on this device"
 SOURCE_UPLOAD = "Upload an image"
@@ -26,18 +26,21 @@ def load_vision_model():
 
 
 def run_inspection(frame_bgr, zoom):
-    """Runs one full inspection: vision -> advisory -> log. Stores the result for display."""
+    """Runs one full inspection: vision -> rules -> Llama advisory -> log. Stores the result for display."""
     # 1. Vision: find the defects (see vision.py)
     found = vision.detect(model, frame_bgr, use_tiles=is_pcb_model, zoom=zoom)
-    detections = found["detections"]
 
-    # 2. Advisory: turn the findings into operator advice (see llm_engine.py)
+    # 2. Rules: give every defect a severity and a location name (see llm_engine.py)
+    height, width = frame_bgr.shape[:2]
+    findings = llm_engine.add_severity_and_location(found["detections"], width, height)
+
+    # 3. Advisory: Llama on ExecuTorch turns the findings into a note for the operator
     t0 = time.perf_counter()
-    advice = get_advisory_recommendation(detections)
+    advice = llm_engine.advise(findings)
     advice_ms = (time.perf_counter() - t0) * 1000
 
-    # 3. Log: one row per inspection
-    log_inspection(detections, advice)
+    # 4. Log: one row per inspection
+    log_inspection(findings, advice["text"])
 
     # Prepare the picture for the browser: shrink it if it is huge, and convert
     # OpenCV's BGR colour order to the RGB order that browsers expect.
@@ -49,7 +52,7 @@ def run_inspection(frame_bgr, zoom):
     # Keep the result so it stays on screen when Streamlit reruns the script.
     st.session_state["last_result"] = {
         "image_rgb": cv2.cvtColor(picture, cv2.COLOR_BGR2RGB),
-        "detections": detections,
+        "findings": findings,
         "advice": advice,
         "vision_ms": found["vision_ms"],
         "tiles": found["tiles"],
@@ -113,7 +116,7 @@ with left_col:
             new_frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)   # YOLO expects BGR arrays
 
     if new_frame is not None:
-        with st.spinner("Inspecting..."):
+        with st.spinner("Inspecting: vision first, then the Llama advisory..."):
             run_inspection(new_frame, zoom)
 
     last = st.session_state.get("last_result")
@@ -125,14 +128,31 @@ with left_col:
         )
 
 with right_col:
-    st.subheader("🤖 Llama 3.2 Edge Advisory (ExecuTorch)")
+    st.subheader("🤖 Operator Advisory")
     if last:
-        if last["detections"]:
-            st.error(f"FAIL: {len(last['detections'])} defect(s) found")
+        findings, advice = last["findings"], last["advice"]
+        if findings:
+            st.error(f"FAIL: {len(findings)} defect(s) found, highest severity {llm_engine.highest_severity(findings)}")
         else:
             st.success("PASS: no defects found")
-        st.info(last["advice"])
-        st.json(last["detections"], expanded=False)
+
+        # Two spaces before a line break make Markdown keep the three lines separate.
+        st.info(advice["text"].replace("\n", "  \n"))
+
+        if advice["source"] == "llama":
+            stats = advice["stats"]
+            st.caption(
+                f"Written on this device by Llama 3.2 1B (ExecuTorch, XNNPACK). "
+                f"{stats.get('tokens_per_second', '?')} tokens/s, "
+                f"first token after {stats.get('time_to_first_token_ms', '?')} ms, "
+                f"peak memory {stats.get('peak_memory_mb', '?')} MB."
+            )
+        elif advice["source"] == "rules":
+            st.caption(f"Written by the built-in rules, not by Llama ({advice.get('error', 'Llama unavailable')}).")
+
+        if findings:
+            table = pd.DataFrame(findings)[["defect", "severity", "location", "size_pct", "confidence"]]
+            st.dataframe(table, hide_index=True)
     else:
         st.write("Awaiting PCB scan...")
 
