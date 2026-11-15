@@ -3,11 +3,15 @@
 What happens here, in order:
   1. Fixed RULES give every detected defect a severity and a location name.
      (Rules decide; the language model does not.)
-  2. The findings are written into a short, structured prompt.
-  3. Llama 3.2 1B, running on ExecuTorch in its own Python environment, turns
-     that prompt into a three-line note for the operator (see llama_runner.py).
-  4. If Llama is not installed on this computer (for example a Windows laptop),
-     a plain rule-based note is produced instead, and it is labelled as such.
+  2. The code writes the factual summary line itself, so the counts, types,
+     severities and locations shown to the operator are always exact.
+  3. Llama 3.2 1B, running on ExecuTorch in its own Python environment, writes
+     the instruction for the operator: what to do and where, most severe defect
+     first (see llama_runner.py).
+  4. Llama's instruction is checked. If it is cut off, leaves out the most severe
+     defect or names a defect that was not found, or if Llama is not installed
+     on this computer, a plain rule-based instruction is shown instead and it is
+     labelled as such.
 """
 import json
 import os
@@ -45,58 +49,49 @@ BASE_SEVERITY = {
 }
 LARGE_DEFECT_FRACTION = 0.03
 
-# Short reference notes given to Llama so its advice is grounded in facts
-# instead of guesses. One likely cause and one action per defect type.
-DEFECT_NOTES = {
-    "missing_hole": {
-        "cause": "a drill hit was skipped or the wrong drill program was used",
-        "action": "compare the board with the drill file, re-drill if the pad allows it, otherwise reject the board",
-    },
-    "mouse_bite": {
-        "cause": "over-etching or a flaw in the resist removed copper from the edge of a track",
-        "action": "measure the remaining track width and repair or reject if it is below the design minimum",
-    },
-    "open_circuit": {
-        "cause": "a scratch in the resist or over-etching broke the track",
-        "action": "confirm with a continuity test, then repair the track if repairs are allowed, otherwise reject the board",
-    },
-    "short": {
-        "cause": "under-etching or resist residue left copper bridging two tracks",
-        "action": "cut the copper bridge under magnification and confirm isolation with a multimeter",
-    },
-    "spur": {
-        "cause": "under-etching or a resist flaw left a copper spike sticking out of a track",
-        "action": "check the clearance to the neighbouring track and trim the spike if it is below the design rule",
-    },
-    "spurious_copper": {
-        "cause": "resist residue protected a patch of copper that should have been etched away",
-        "action": "remove the copper if it is close to a track or pad, otherwise record it and accept the board",
-    },
+# The standard action for each defect type. Llama is given these so that its
+# instruction is grounded in facts instead of guesses.
+DEFECT_ACTIONS = {
+    "missing_hole": "compare the board with the drill file, re-drill if the pad allows it, otherwise reject the board",
+    "mouse_bite": "measure the remaining track width and repair or reject if it is below the design minimum",
+    "open_circuit": "confirm with a continuity test, then repair the track if repairs are allowed, otherwise reject the board",
+    "short": "cut the copper bridge under magnification and confirm isolation with a multimeter",
+    "spur": "check the clearance to the neighbouring track and trim the spike if it is below the design rule",
+    "spurious_copper": "remove the copper if it is close to a track or pad, otherwise record it and accept the board",
 }
+UNKNOWN_ACTION = "send the board for manual inspection"
+
+# How each defect type may be written in a sentence (with a space or an underscore).
+# \b marks a word boundary, so "spur" does not match inside "spurious".
+DEFECT_PATTERNS = {name: re.compile(r"\b" + name.replace("_", "[ _]") + r"\b", re.IGNORECASE) for name in DEFECT_ACTIONS}
 
 SYSTEM_PROMPT = (
-    "You write short notes for operators on a bare PCB inspection line. "
-    "The defects were found by a vision model and their severities were set by fixed rules, "
-    "so never change them. Use only the facts and reference notes in the message. "
-    "Answer with exactly three lines that start with Summary:, Cause: and Action:, one sentence each."
+    "You write the instruction an operator sees when a bare PCB fails inspection. "
+    "You are given the defects, already ordered from most to least severe, each with its standard action. "
+    "Write one instruction of one to three sentences that tells the operator what to do and where on the board, "
+    "starting with the most severe defect. Use only the information given. "
+    "Do not mention causes, sizes or confidence."
 )
 
-# One worked example shown to Llama before the real question. A model this small
+# Two worked examples shown to Llama before the real board. A model this small
 # follows a pattern it has just seen far more reliably than a written instruction.
-EXAMPLE_FACTS = [
-    {"defect": "missing_hole", "severity": "High", "location": "top-left", "size_pct": 2.1, "confidence": 0.88},
-    {"defect": "mouse_bite", "severity": "Medium", "location": "centre", "size_pct": 1.6, "confidence": 0.79},
+EXAMPLES = [
+    (
+        [{"defect": "missing_hole", "severity": "High", "location": "top-left"},
+         {"defect": "mouse_bite", "severity": "Medium", "location": "centre"}],
+        "Action: Hold this board. First compare the missing hole at top-left with the drill file and re-drill it "
+        "if the pad allows, otherwise reject the board. Then measure the remaining track width at the mouse bite "
+        "in the centre and repair or reject it if it is below the design minimum.",
+    ),
+    (
+        [{"defect": "spurious_copper", "severity": "Low", "location": "top-right"},
+         {"defect": "spurious_copper", "severity": "Low", "location": "top-right"},
+         {"defect": "spurious_copper", "severity": "Low", "location": "bottom-centre"}],
+        "Action: Hold this board. Check the three patches of spurious copper at top-right and bottom-centre, "
+        "remove any that are close to a track or pad, then record the rest and accept the board.",
+    ),
 ]
-EXAMPLE_ANSWER = (
-    "Summary: The board fails with 2 defects, a High severity missing_hole at top-left and a "
-    "Medium severity mouse_bite at centre.\n"
-    "Cause: The missing hole points to a skipped drill hit or a wrong drill program, and the "
-    "mouse bite to over-etching at the edge of a track.\n"
-    "Action: Compare the board with the drill file and re-drill or reject it, then measure the "
-    "remaining track width at the mouse bite."
-)
-ANSWER_PREFIX = "Summary:"       # the answer is forced to begin with this word
-NOTE_LABELS = ("Summary:", "Cause:", "Action:")
+ANSWER_PREFIX = "Action:"        # the answer is forced to begin with this word
 
 
 def _location_name(cx, cy, width, height):
@@ -138,71 +133,77 @@ def highest_severity(findings):
     return max((f["severity"] for f in findings), key=LEVELS.index)
 
 
-def build_user_prompt(findings):
-    """Writes the findings and the matching reference notes as plain sentences for Llama.
+def group_findings(findings):
+    """Groups defects of the same type and severity, most severe first.
 
-    Defects of the same type and severity are grouped into one sentence, so a
-    board with ten spurs still gives a short prompt.
+    Returns a list of (defect, severity, count, places), where places are the
+    distinct location names in the order they were found.
     """
     groups = {}
     for f in findings:
-        groups.setdefault((f["defect"], f["severity"]), []).append(f)
+        places = groups.setdefault((f["defect"], f["severity"]), {"count": 0, "places": []})
+        places["count"] += 1
+        if f["location"] not in places["places"]:
+            places["places"].append(f["location"])
     ordered = sorted(groups.items(), key=lambda item: LEVELS.index(item[0][1]), reverse=True)
+    return [(defect, severity, g["count"], g["places"]) for (defect, severity), g in ordered]
 
-    lines = [f"Facts: {len(findings)} defect(s) found, highest severity {highest_severity(findings)}."]
-    for (defect, severity), members in ordered:
-        places = []
-        for m in members:
-            if m["location"] not in places:
-                places.append(m["location"])
-        confidences = [m["confidence"] for m in members]
-        confidence = f"{min(confidences)}" if len(members) == 1 else f"{min(confidences)} to {max(confidences)}"
-        lines.append(
-            f"{len(members)} {defect} (severity {severity}) at {', '.join(places)}; "
-            f"largest is {max(m['size_pct'] for m in members)}% of the board; confidence {confidence}."
-        )
 
-    lines.append("Reference notes:")
-    for (defect, _), _ in ordered:
-        if defect in DEFECT_NOTES:
-            note = DEFECT_NOTES[defect]
-            line = f"- {defect}: cause: {note['cause']}; action: {note['action']}."
-            if line not in lines:
-                lines.append(line)
+def _join(words):
+    """['a', 'b', 'c'] -> 'a, b and c'"""
+    return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def summary_line(findings):
+    """The factual summary, written by code so that it is always exact."""
+    if not findings:
+        return "No surface defects detected."
+    parts = [f"{count} {defect} ({severity}) at {_join(places)}" for defect, severity, count, places in group_findings(findings)]
+    return f"{len(findings)} defect(s): " + "; ".join(parts) + "."
+
+
+def build_user_prompt(findings):
+    """Writes each group of defects on one line together with its standard action."""
+    lines = []
+    for defect, severity, count, places in group_findings(findings):
+        action = DEFECT_ACTIONS.get(defect, UNKNOWN_ACTION)
+        lines.append(f"- {count} {defect}, severity {severity}, at {_join(places)}. Standard action: {action}.")
     return "\n".join(lines)
 
 
-def parse_note(answer):
-    """Pulls the Summary, Cause and Action sentences out of Llama's answer.
+def rule_based_action(findings):
+    """The operator instruction written without a language model."""
+    sentences = ["Hold this board."]
+    for defect, _, count, places in group_findings(findings):
+        action = DEFECT_ACTIONS.get(defect, UNKNOWN_ACTION)
+        what = f"the {defect}" if count == 1 else f"the {count} {defect} defects"
+        sentences.append(f"For {what} at {_join(places)}, {action}.")
+    return "Action: " + " ".join(sentences)
 
-    Small models sometimes add a greeting, repeat the input or keep talking after
-    the third line. We keep the first sentence found for each label and drop the rest.
-    Raises RuntimeError if any of the three is missing.
+
+def check_action(answer, findings):
+    """Tidies Llama's instruction and checks it against the findings.
+
+    Returns the instruction, or raises RuntimeError saying what was wrong with it.
     """
-    found = {}
-    for chunk in re.split(r"(?=(?:Summary|Cause|Action):)", answer):
-        chunk = chunk.strip()
-        for label in NOTE_LABELS:
-            if chunk.startswith(label) and label not in found:
-                first_line = chunk.splitlines()[0].strip()
-                if len(first_line) > len(label) + 10:       # ignore an empty or cut-off line
-                    found[label] = first_line
-    missing = [label for label in NOTE_LABELS if label not in found]
-    if missing:
-        raise RuntimeError(f"Llama's answer had no usable {' / '.join(missing)} line")
-    return "\n".join(found[label] for label in NOTE_LABELS)
+    lines = answer.strip().splitlines()
+    text = lines[0].strip() if lines else ""                    # ignore anything after the first paragraph
+    if not text.startswith(ANSWER_PREFIX):
+        raise RuntimeError("Llama's answer did not start with Action:")
+    if text[-1] not in ".!":                                    # cut off at the length limit:
+        text = text[:text.rfind(".") + 1]                       # keep only the complete sentences
+    if len(text) < len(ANSWER_PREFIX) + 20:
+        raise RuntimeError("Llama's answer was empty or cut off")
 
-
-def rule_based_note(findings):
-    """The same three-line note written without a language model."""
-    worst = max(findings, key=lambda f: LEVELS.index(f["severity"]))
-    note = DEFECT_NOTES.get(worst["defect"], {"cause": "unknown", "action": "send the board for manual inspection"})
-    types = ", ".join(sorted({f["defect"] for f in findings}))
-    return (
-        f"Summary: {len(findings)} defect(s) found ({types}); highest severity {worst['severity']}.\n"
-        f"Cause: {worst['defect']} is most likely because {note['cause']}.\n"
-        f"Action: {note['action'][0].upper()}{note['action'][1:]}."
-    )
+    found_types = {f["defect"] for f in findings}
+    mentioned = {name for name, pattern in DEFECT_PATTERNS.items() if pattern.search(text)}
+    most_severe = group_findings(findings)[0][0]
+    if most_severe in DEFECT_PATTERNS and most_severe not in mentioned:
+        raise RuntimeError(f"Llama's answer left out the most severe defect ({most_severe})")
+    invented = sorted(mentioned - found_types)
+    if invented:
+        raise RuntimeError(f"Llama's answer named a defect that was not found ({', '.join(invented)})")
+    return text
 
 
 def llama_available():
@@ -210,7 +211,7 @@ def llama_available():
     return all(os.path.exists(p) for p in (ET_PYTHON, RUNNER, MODEL_FILE))
 
 
-def ask_llama(user_text, max_new_tokens=110):
+def ask_llama(user_text, max_new_tokens=120):
     """Runs llama_runner.py in the ExecuTorch environment and returns its result dictionary.
 
     The runner is a separate program, so we send the request as JSON on its standard
@@ -219,7 +220,7 @@ def ask_llama(user_text, max_new_tokens=110):
     """
     request = json.dumps({
         "system": SYSTEM_PROMPT,
-        "examples": [[build_user_prompt(EXAMPLE_FACTS), EXAMPLE_ANSWER]],
+        "examples": [[build_user_prompt(facts), answer] for facts, answer in EXAMPLES],
         "user": user_text,
         "assistant_prefix": ANSWER_PREFIX,
         "max_new_tokens": max_new_tokens,
@@ -237,29 +238,37 @@ def ask_llama(user_text, max_new_tokens=110):
 
 
 def advise(findings):
-    """Turns the findings into an operator note.
+    """Turns the findings into what the operator sees.
 
     Returns a dictionary:
-      text   : the note
-      source : 'llama' (generated on-device by Llama via ExecuTorch), 'rules'
-               (written by the fixed rules) or 'none' (clean board)
-      stats  : speed figures from Llama, when it was used
-      raw    : Llama's full answer before tidying, when it was used
-      error  : why Llama was not used, when that happened
+      summary : the factual line, always written by code
+      text    : the instruction for the operator
+      source  : 'llama' (written on-device by Llama via ExecuTorch), 'rules'
+                (written by the fixed rules) or 'none' (clean board)
+      stats   : speed figures from Llama, when it was used
+      raw     : Llama's full answer before tidying, when it produced one
+      error   : why Llama's answer was not used, when that happened
     """
+    summary = summary_line(findings)
     if not findings:
-        return {"text": "No surface defects detected. Pass the board to the next stage.", "source": "none", "stats": {}}
+        return {"summary": summary, "text": "Action: Pass the board to the next stage.", "source": "none", "stats": {}}
 
+    fallback = {"summary": summary, "text": rule_based_action(findings), "source": "rules", "stats": {}}
     if not llama_available():
-        return {"text": rule_based_note(findings), "source": "rules", "stats": {},
-                "error": "Llama is not installed on this computer"}
+        fallback["error"] = "Llama is not installed on this computer"
+        return fallback
 
     try:
         result = ask_llama(build_user_prompt(findings))
-        return {"text": parse_note(result["text"]), "source": "llama", "stats": result.get("stats", {}),
-                "raw": result["text"]}
-    except Exception as exc:                      # timeout, crash, or an answer in the wrong shape
-        return {"text": rule_based_note(findings), "source": "rules", "stats": {}, "error": str(exc)}
+    except Exception as exc:                      # timeout, crash, unreadable output
+        fallback["error"] = str(exc)
+        return fallback
+    try:
+        text = check_action(result["text"], findings)
+    except RuntimeError as exc:                   # an answer that failed the checks
+        fallback.update(error=str(exc), raw=result["text"], stats=result.get("stats", {}))
+        return fallback
+    return {"summary": summary, "text": text, "source": "llama", "stats": result.get("stats", {}), "raw": result["text"]}
 
 
 if __name__ == "__main__":
@@ -288,13 +297,14 @@ if __name__ == "__main__":
         print(f"\n================ Case {name} ================")
         print(build_user_prompt(case_findings))
         answer = advise(case_findings)
-        print(f"\n--- Note shown to the operator (source: {answer['source']}) ---")
+        print(f"\n--- Shown to the operator (instruction source: {answer['source']}) ---")
+        print(answer["summary"])
         print(answer["text"])
         if answer.get("raw"):
             print("\n--- Llama's full answer before tidying ---")
             print(answer["raw"])
         if answer.get("error"):
-            print("\nWhy Llama was not used:", answer["error"])
+            print("\nWhy Llama's answer was not used:", answer["error"])
         if answer["stats"]:
             print("\n--- Speed ---")
             for key, value in answer["stats"].items():

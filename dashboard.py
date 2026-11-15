@@ -25,22 +25,18 @@ def load_vision_model():
     return vision.load_model()
 
 
-def run_inspection(frame_bgr, zoom):
-    """Runs one full inspection: vision -> rules -> Llama advisory -> log. Stores the result for display."""
+def run_vision(frame_bgr, zoom):
+    """First half of an inspection: find the defects and grade them. Takes a few seconds.
+
+    The result is stored with advice = None. The advisory half runs afterwards,
+    so the operator sees the PASS/FAIL verdict without waiting for Llama.
+    """
     # 1. Vision: find the defects (see vision.py)
     found = vision.detect(model, frame_bgr, use_tiles=is_pcb_model, zoom=zoom)
 
     # 2. Rules: give every defect a severity and a location name (see llm_engine.py)
     height, width = frame_bgr.shape[:2]
     findings = llm_engine.add_severity_and_location(found["detections"], width, height)
-
-    # 3. Advisory: Llama on ExecuTorch turns the findings into a note for the operator
-    t0 = time.perf_counter()
-    advice = llm_engine.advise(findings)
-    advice_ms = (time.perf_counter() - t0) * 1000
-
-    # 4. Log: one row per inspection
-    log_inspection(findings, advice["text"])
 
     # Prepare the picture for the browser: shrink it if it is huge, and convert
     # OpenCV's BGR colour order to the RGB order that browsers expect.
@@ -53,11 +49,21 @@ def run_inspection(frame_bgr, zoom):
     st.session_state["last_result"] = {
         "image_rgb": cv2.cvtColor(picture, cv2.COLOR_BGR2RGB),
         "findings": findings,
-        "advice": advice,
         "vision_ms": found["vision_ms"],
         "tiles": found["tiles"],
-        "advice_ms": advice_ms,
+        "advice": None,
+        "advice_ms": None,
     }
+
+
+def run_advisory(result):
+    """Second half of an inspection: operator instruction from Llama, then the log entry."""
+    t0 = time.perf_counter()
+    advice = llm_engine.advise(result["findings"])
+    result["advice_ms"] = (time.perf_counter() - t0) * 1000
+    result["advice"] = advice
+    # One log row per inspection, written once the instruction exists.
+    log_inspection(result["findings"], f"{advice['summary']} {advice['text']}")
 
 
 @st.fragment(run_every="2s")
@@ -116,39 +122,43 @@ with left_col:
             new_frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)   # YOLO expects BGR arrays
 
     if new_frame is not None:
-        with st.spinner("Inspecting: vision first, then the Llama advisory..."):
-            run_inspection(new_frame, zoom)
+        with st.spinner("Inspecting..."):
+            run_vision(new_frame, zoom)
 
     last = st.session_state.get("last_result")
     if last:
         st.image(last["image_rgb"], caption="Detection overlay", output_format="JPEG")
-        st.caption(
-            f"Vision: {last['vision_ms']:.0f} ms over {last['tiles']} tile(s)  |  "
-            f"Advisory: {last['advice_ms']:.0f} ms  |  Model: {model_path}"
-        )
+        st.caption(f"Vision: {last['vision_ms']:.0f} ms over {last['tiles']} tile(s)  |  Model: {model_path}")
 
 with right_col:
     st.subheader("🤖 Operator Advisory")
     if last:
-        findings, advice = last["findings"], last["advice"]
+        findings = last["findings"]
+
+        # The verdict comes from the vision model and the rules, so it is shown at once.
         if findings:
             st.error(f"FAIL: {len(findings)} defect(s) found, highest severity {llm_engine.highest_severity(findings)}")
         else:
             st.success("PASS: no defects found")
 
-        # Two spaces before a line break make Markdown keep the three lines separate.
-        st.info(advice["text"].replace("\n", "  \n"))
+        # The instruction takes longer, so it is produced after the verdict is on screen.
+        if last["advice"] is None:
+            with st.spinner("Llama is writing the operator instruction..."):
+                run_advisory(last)
+        advice = last["advice"]
+
+        st.info(f"**{advice['summary']}**  \n{advice['text']}")
 
         if advice["source"] == "llama":
             stats = advice["stats"]
             st.caption(
-                f"Written on this device by Llama 3.2 1B (ExecuTorch, XNNPACK). "
-                f"{stats.get('tokens_per_second', '?')} tokens/s, "
+                f"Instruction written on this device by Llama 3.2 1B (ExecuTorch, XNNPACK) in "
+                f"{last['advice_ms'] / 1000:.1f} s: {stats.get('tokens_per_second', '?')} tokens/s, "
                 f"first token after {stats.get('time_to_first_token_ms', '?')} ms, "
                 f"peak memory {stats.get('peak_memory_mb', '?')} MB."
             )
         elif advice["source"] == "rules":
-            st.caption(f"Written by the built-in rules, not by Llama ({advice.get('error', 'Llama unavailable')}).")
+            st.caption(f"Instruction written by the built-in rules, not by Llama ({advice.get('error', 'Llama unavailable')}).")
 
         if findings:
             table = pd.DataFrame(findings)[["defect", "severity", "location", "size_pct", "confidence"]]
