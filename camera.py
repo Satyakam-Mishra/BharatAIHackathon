@@ -38,8 +38,26 @@ def _open_ribbon_camera():
     cam.configure(config)
     cam.start()
     time.sleep(CSI_WARMUP_S)
+    _apply_saved_focus()
     _picam = cam
     return cam
+
+
+def _apply_saved_focus():
+    """Moves the motorised lens to the setting saved by focus.py, if there is one.
+
+    The focus motor only holds its position while the camera is running, so this
+    is done every time the camera starts. A failure here is reported but does not
+    stop the camera.
+    """
+    try:
+        import focus
+        value = focus.saved_focus()
+        if value is not None:
+            focus.set_focus(value)
+            time.sleep(focus.SETTLE_S)
+    except Exception as exc:
+        print(f"Could not set the lens focus: {exc}")
 
 
 def camera_name():
