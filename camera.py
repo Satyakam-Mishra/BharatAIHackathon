@@ -18,10 +18,11 @@ USB_CAMERA_INDEX = 0        # 0 = first USB camera
 CSI_WARMUP_S = 2.0          # time for automatic exposure and white balance to settle
 
 _picam = None               # the ribbon camera, kept open between captures (opening takes ~2 s)
+_focus = None               # result of the last autofocus, see focus.autofocus()
 
 
 def _open_ribbon_camera():
-    """Opens the ribbon camera once and keeps it running. Returns None if there is none."""
+    """Opens the ribbon camera once, focuses it, and keeps it running. Returns None if there is none."""
     global _picam
     if _picam is not None:
         return _picam
@@ -31,33 +32,58 @@ def _open_ribbon_camera():
         return None
     if not Picamera2.global_camera_info():  # no ribbon camera detected
         return None
+    import focus
     cam = Picamera2()
-    # Full sensor resolution (4056 x 3040 for the IMX477). "RGB888" in Picamera2
-    # stores each pixel as blue, green, red, which is the order OpenCV expects.
-    config = cam.create_still_configuration(main={"size": cam.sensor_resolution, "format": "RGB888"})
+    # Full sensor resolution (4056 x 3040 for the IMX477) for inspection pictures.
+    # "RGB888" in Picamera2 stores each pixel as blue, green, red, which is the
+    # order OpenCV expects. The small "lores" stream is only used for autofocus.
+    config = cam.create_still_configuration(
+        main={"size": cam.sensor_resolution, "format": "RGB888"},
+        lores={"size": focus.LORES_SIZE},
+    )
     cam.configure(config)
     cam.start()
     time.sleep(CSI_WARMUP_S)
-    _apply_saved_focus()
     _picam = cam
+    refocus()
     return cam
 
 
-def _apply_saved_focus():
-    """Moves the motorised lens to the setting saved by focus.py, if there is one.
+def refocus():
+    """Runs autofocus on the ribbon camera and remembers the result.
 
     The focus motor only holds its position while the camera is running, so this
-    is done every time the camera starts. A failure here is reported but does not
-    stop the camera.
+    runs every time the camera starts. If autofocus cannot run (no focus motor,
+    I2C switched off), the last saved setting is used instead. A failure is
+    reported but never stops the camera. Returns the result, or None.
     """
+    global _focus
+    if _picam is None:
+        return None
+    import focus
     try:
-        import focus
-        value = focus.saved_focus()
-        if value is not None:
-            focus.set_focus(value)
-            time.sleep(focus.SETTLE_S)
+        _focus = focus.autofocus(_picam, focus.find_camera_bus())
+        focus.save_focus(_focus["value"])
     except Exception as exc:
-        print(f"Could not set the lens focus: {exc}")
+        print(f"Autofocus failed: {exc}")
+        _focus = None
+        try:
+            value = focus.saved_focus()
+            if value is not None:
+                focus.set_focus(value)
+        except Exception as exc2:
+            print(f"Could not set the saved focus either: {exc2}")
+    return _focus
+
+
+def focus_status():
+    """A short description of the current focus, for the dashboard."""
+    if _picam is None:
+        return None
+    if _focus is None:
+        return "autofocus not available"
+    import focus
+    return focus.describe(_focus)
 
 
 def camera_name():

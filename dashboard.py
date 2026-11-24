@@ -148,6 +148,13 @@ with left_col:
 
     if source == SOURCE_CAMERA:
         st.caption(f"Camera: {camera.camera_name()}")
+        status = camera.focus_status()
+        if status is not None:
+            st.caption(f"Focus: {status}")
+            if st.button("Refocus camera (keep hands out of view, about 10 s)"):
+                with st.spinner("Focusing..."):
+                    camera.refocus()
+                st.rerun()
         if st.button("Capture and inspect", type="primary"):
             new_frame = camera.capture_frame()
             if new_frame is None:
