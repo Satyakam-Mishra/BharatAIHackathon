@@ -5,6 +5,10 @@ photo is inspected the same way here: cut it into overlapping tiles, run the
 model on each tile, shift the boxes back to their place in the full photo and
 merge the duplicates found where tiles overlap.
 
+Before any of that, a small classifier (the "PCB check") looks at the whole
+picture and decides whether it shows a PCB at all. If it does not, there is no
+PASS or FAIL: the station reports that no PCB is in view.
+
 This file has nothing to do with Llama. The advisory pipeline lives in
 llm_engine.py and runs on a different runtime (ExecuTorch).
 """
@@ -18,11 +22,13 @@ from ultralytics import YOLO
 # Settings
 # ---------------------------------------------------------------------------
 PCB_MODEL = "yolo_pcb.onnx"       # our fine-tuned PCB defect model (from Colab)
+GATE_MODEL = "pcb_gate.onnx"      # the PCB check: "is there a PCB in this picture?"
+GATE_THRESHOLD = 0.60             # below this probability of "pcb", report "no PCB in view"
+GATE_IMGSZ = 224                  # the PCB check looks at the whole picture shrunk to 224 x 224
 FALLBACK_MODEL = "yolov8n.onnx"   # stock model, only for testing the plumbing
 TILE = 640                        # tile size in pixels, same as in training
 STRIDE = 512                      # step between tiles (640 - 512 = 128 px overlap)
 CONF_THRESHOLD = 0.30             # ignore detections below 30% confidence
-CAMERA_INDEX = 0                  # 0 = first camera plugged into this computer
 
 # One colour per class (BGR order, because OpenCV draws in BGR)
 COLOURS = [(0, 0, 255), (0, 165, 255), (255, 0, 255), (255, 0, 0), (0, 200, 0), (200, 200, 0)]
@@ -34,23 +40,16 @@ def load_model():
     return YOLO(path, task="detect"), path
 
 
-def capture_frame():
-    """Takes one picture from the USB camera of the computer running this code.
+def load_gate():
+    """Loads the PCB check if its file exists, otherwise returns None (check skipped)."""
+    return YOLO(GATE_MODEL, task="classify") if os.path.exists(GATE_MODEL) else None
 
-    Returns the picture in OpenCV's BGR colour order, or None if it failed.
-    """
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        return None
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    # The first few frames are often dark while the camera adjusts its exposure,
-    # so we read and throw away five frames before keeping one.
-    for _ in range(5):
-        cap.read()
-    ok, frame = cap.read()
-    cap.release()
-    return frame if ok else None
+
+def pcb_probability(gate, frame_bgr):
+    """How sure the PCB check is that the picture shows a PCB, from 0 to 1."""
+    result = gate(frame_bgr, imgsz=GATE_IMGSZ, verbose=False)[0]
+    pcb_index = [i for i, name in result.names.items() if name == "pcb"][0]
+    return float(result.probs.data[pcb_index])
 
 
 def tile_starts(length):

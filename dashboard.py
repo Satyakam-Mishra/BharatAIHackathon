@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
+import camera
 import llm_engine
 import vision
 from hardware_logger import init_db, get_hardware_metrics, log_inspection
@@ -25,12 +26,50 @@ def load_vision_model():
     return vision.load_model()
 
 
+@st.cache_resource
+def load_pcb_check():
+    """Loads the PCB check once. None means its file is missing and the check is skipped."""
+    return vision.load_gate()
+
+
+def _for_browser(picture_bgr):
+    """Shrinks a picture if it is huge and converts BGR to the RGB order browsers expect."""
+    if picture_bgr.shape[1] > DISPLAY_WIDTH:
+        scale = DISPLAY_WIDTH / picture_bgr.shape[1]
+        picture_bgr = cv2.resize(picture_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(picture_bgr, cv2.COLOR_BGR2RGB)
+
+
 def run_vision(frame_bgr, zoom):
-    """First half of an inspection: find the defects and grade them. Takes a few seconds.
+    """First half of an inspection: check for a PCB, find the defects and grade them.
 
     The result is stored with advice = None. The advisory half runs afterwards,
-    so the operator sees the PASS/FAIL verdict without waiting for Llama.
+    so the operator sees the verdict without waiting for Llama.
     """
+    # 0. PCB check: is there a board in the picture at all?
+    pcb_prob = None
+    if gate is not None:
+        t0 = time.perf_counter()
+        pcb_prob = vision.pcb_probability(gate, frame_bgr)
+        gate_ms = (time.perf_counter() - t0) * 1000
+        if pcb_prob < vision.GATE_THRESHOLD:
+            # No PCB: no PASS or FAIL, no defect search, no Llama.
+            summary = "No PCB in view."
+            text = "Action: Place a PCB under the camera and inspect again."
+            log_inspection([], f"{summary} {text}", label="No PCB")
+            st.session_state["last_result"] = {
+                "no_pcb": True,
+                "image_rgb": _for_browser(frame_bgr),
+                "findings": [],
+                "pcb_prob": pcb_prob,
+                "vision_ms": gate_ms,
+                "tiles": 0,
+                "zoom": zoom,
+                "advice": {"summary": summary, "text": text, "source": "none", "stats": {}},
+                "advice_ms": 0.0,
+            }
+            return
+
     # 1. Vision: find the defects (see vision.py)
     found = vision.detect(model, frame_bgr, use_tiles=is_pcb_model, zoom=zoom)
 
@@ -38,17 +77,12 @@ def run_vision(frame_bgr, zoom):
     height, width = frame_bgr.shape[:2]
     findings = llm_engine.add_severity_and_location(found["detections"], width, height)
 
-    # Prepare the picture for the browser: shrink it if it is huge, and convert
-    # OpenCV's BGR colour order to the RGB order that browsers expect.
-    picture = found["annotated_bgr"]
-    if picture.shape[1] > DISPLAY_WIDTH:
-        scale = DISPLAY_WIDTH / picture.shape[1]
-        picture = cv2.resize(picture, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-
     # Keep the result so it stays on screen when Streamlit reruns the script.
     st.session_state["last_result"] = {
-        "image_rgb": cv2.cvtColor(picture, cv2.COLOR_BGR2RGB),
+        "no_pcb": False,
+        "image_rgb": _for_browser(found["annotated_bgr"]),
         "findings": findings,
+        "pcb_prob": pcb_prob,
         "vision_ms": found["vision_ms"],
         "tiles": found["tiles"],
         "zoom": zoom,
@@ -82,9 +116,12 @@ def show_telemetry():
 # ---------------------------------------------------------------------------
 model, model_path = load_vision_model()
 is_pcb_model = model_path == vision.PCB_MODEL
+gate = load_pcb_check()
 
 st.title("🔧 On-Device PCB Visual Inspection Assistant")
 show_telemetry()
+if gate is None:
+    st.info(f"'{vision.GATE_MODEL}' was not found, so the PCB check is skipped and every picture is treated as a PCB.")
 if not is_pcb_model:
     st.warning(
         f"'{vision.PCB_MODEL}' was not found, so the stock test model is loaded. "
@@ -98,9 +135,10 @@ with left_col:
     st.subheader("📸 PCB Input")
     source = st.radio("Select input source:", [SOURCE_CAMERA, SOURCE_UPLOAD], horizontal=True)
     zoom = st.slider(
-        "Zoom before inspection", 1.0, 3.0, 1.0, 0.5,
-        help="Enlarges the picture before it is cut into tiles. Leave at 1.0 for the full-size "
-             "dataset photos. Raise it when the camera is far from the board and defects look tiny.",
+        "Zoom before inspection", 0.5, 3.0, 1.0, 0.25,
+        help="Resizes the picture before it is cut into tiles. Leave at 1.0 for the full-size "
+             "dataset photos. Raise it when defects look tiny; lower it for very large camera "
+             "pictures to inspect faster (fewer tiles).",
     )
 
     # new_frame stays None unless a NEW picture arrives in this run.
@@ -109,8 +147,9 @@ with left_col:
     new_frame = None
 
     if source == SOURCE_CAMERA:
+        st.caption(f"Camera: {camera.camera_name()}")
         if st.button("Capture and inspect", type="primary"):
-            new_frame = vision.capture_frame()
+            new_frame = camera.capture_frame()
             if new_frame is None:
                 st.error("Could not read from the camera. Check that it is plugged in.")
     else:
@@ -138,9 +177,14 @@ with left_col:
     last = st.session_state.get("last_result")
     if last:
         st.image(last["image_rgb"], caption="Detection overlay", output_format="JPEG")
-        st.caption(
-            f"Vision: {last['vision_ms']:.0f} ms over {last['tiles']} tile(s) at zoom {last['zoom']}  |  Model: {model_path}"
-        )
+        check = "PCB check: not installed" if last["pcb_prob"] is None else f"PCB check: {last['pcb_prob']:.2f}"
+        if last["no_pcb"]:
+            st.caption(f"{check}  |  Defect search skipped")
+        else:
+            st.caption(
+                f"{check}  |  Vision: {last['vision_ms']:.0f} ms over {last['tiles']} tile(s) "
+                f"at zoom {last['zoom']}  |  Model: {model_path}"
+            )
 
 with right_col:
     st.subheader("🤖 Operator Advisory")
@@ -148,7 +192,9 @@ with right_col:
         findings = last["findings"]
 
         # The verdict comes from the vision model and the rules, so it is shown at once.
-        if findings:
+        if last["no_pcb"]:
+            st.warning("NO PCB IN VIEW: neither PASS nor FAIL")
+        elif findings:
             st.error(f"FAIL: {len(findings)} defect(s) found, highest severity {llm_engine.highest_severity(findings)}")
         else:
             st.success("PASS: no defects found")
