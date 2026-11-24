@@ -14,6 +14,7 @@ Usage, on the Pi, with the dashboard STOPPED (only one program can use the camer
     python3 focus.py sweep        # find the sharpest setting and save it
     python3 focus.py set 450      # save a setting by hand
     python3 focus.py photo        # take focus_test.jpg with the saved setting
+    python3 focus.py meter        # live sharpness number while you turn the lens by hand
 """
 import glob
 import os
@@ -151,18 +152,53 @@ def photo():
     print(f"focus_test.jpg taken at focus {value} (sharpness {sharpness(frame):.1f}).")
 
 
+def meter():
+    """Prints a live sharpness number, for setting the lens position by hand.
+
+    The focus motor only moves the lens a short distance. If the lens is screwed
+    too far in or out, no motor setting is sharp, so the lens itself must be
+    turned first. The motor is parked in the middle of its range, so the sweep
+    can later fine-tune in both directions. Turn the lens slowly and watch the
+    number: higher is sharper. Press Ctrl + C to stop.
+    """
+    from picamera2 import Picamera2
+    bus = find_camera_bus()
+    cam = Picamera2()
+    # A smaller picture is enough for judging sharpness and is much faster.
+    cam.configure(cam.create_video_configuration(main={"size": (1332, 990), "format": "RGB888"}))
+    cam.start()
+    time.sleep(1)
+    set_focus(512, bus)
+    best = 0.0
+    print("Turn the lens slowly. Higher number = sharper. Ctrl + C to stop.\n")
+    try:
+        while True:
+            score = sharpness(cam.capture_array("main"))
+            best = max(best, score)
+            bar = "#" * min(60, int(score / max(best, 1e-9) * 60))
+            print(f"\r  sharpness {score:8.1f}   best so far {best:8.1f}   {bar:<60}", end="", flush=True)
+            time.sleep(0.3)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        cam.stop()
+        cam.close()
+
+
 def main():
     args = sys.argv[1:]
     if args == ["sweep"]:
         sweep()
     elif args == ["photo"]:
         photo()
+    elif args == ["meter"]:
+        meter()
     elif len(args) == 2 and args[0] == "set" and args[1].isdigit():
         value = max(FOCUS_MIN, min(FOCUS_MAX, int(args[1])))
         save_focus(value)
         print(f"Saved focus setting {value}. Run 'python3 focus.py photo' to check it.")
     else:
-        sys.exit("Usage: python3 focus.py sweep | set NUMBER | photo")
+        sys.exit("Usage: python3 focus.py sweep | set NUMBER | photo | meter")
 
 
 if __name__ == "__main__":
