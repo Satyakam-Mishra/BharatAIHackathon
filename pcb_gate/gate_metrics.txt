@@ -1,0 +1,8 @@
+PCB check (YOLOv8n-cls, 224 x 224), threshold p(pcb) >= 0.60
+Test pictures recognised correctly:
+  not_pcb  everyday photos + plain scenes     195/195
+  pcb      PCB dataset photos + composites    164/164
+Overall: 359/359 = 1.000
+No photos from the station camera were used; test the check at the station before relying on it.
+
+
