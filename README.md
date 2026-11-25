@@ -1,109 +1,108 @@
-# On-Device PCB Defect Detection and Quality Control Advisory
+# On-Device PCB Defect Inspection and Operator Advisory
 
-An edge AI inspection system for manufactured printed circuit boards (PCBs), developed for the Bharat AI Hackathon.
+An offline PCB inspection station on a Raspberry Pi 5, built for the Bharat AI Hackathon.
 
-The system runs entirely on-device (target: Raspberry Pi 5) without internet or cloud access. It captures an image of a PCB, identifies surface defects, assigns severity and location, gives the operator clear rework instructions, and logs inspection results.
+A camera photographs a bare board. A small classifier checks that a PCB is in view, a YOLOv8n detector searches the full-resolution photo tile by tile for six defect types, fixed rules give an immediate PASS / FAIL verdict with severity and location, and **Llama 3.2 1B Instruct running on-device through ExecuTorch** writes a checked rework instruction for the operator. Nothing needs the internet.
 
-## How It Works
+**Report:** [report/Final_Project_Report.pdf](report/Final_Project_Report.pdf) (also as [.docx](report/Final_Project_Report.docx) and [Markdown](PROJECT_REPORT.md)).
 
-The inspection pipeline has two stages:
+![Inspection pipeline](report/pipeline.png)
 
-1. **Defect Detection (YOLOv8n):**
-   - High-resolution PCB images are cut into overlapping 640x640 tiles (with a 512 px stride) so tiny defects are not lost by downscaling.
-   - The YOLO model detects defects on each tile.
-   - Duplicate detections across overlapping tile boundaries are merged back into full-image coordinates.
-   - The detected defects are: `missing_hole`, `mouse_bite`, `open_circuit`, `short`, `spur`, and `spurious_copper`.
+## Three outcomes
 
-2. **Operator Advisory (Rules + Llama 3.2 via ExecuTorch):**
-   - A deterministic rule engine classifies the severity (High, Medium, Low) and board location (e.g. top-left, centre) of each defect.
-   - The operator immediately sees the PASS/FAIL verdict and defect count.
-   - Llama 3.2 1B Instruct runs on-device using ExecuTorch (with the XNNPACK backend on Arm CPU) to generate a concise, grounded rework instruction for the operator.
-   - The output is validated to make sure every defect and location is covered without hallucinations. If the LLM is unavailable or fails validation, a deterministic rule-based instruction is provided as fallback.
-   - Every inspection is saved to a local SQLite database (`inspection_logs.db`), along with CPU load, RAM usage, and device temperature readings.
+| Under the camera | Result |
+|---|---|
+| A PCB with no defects found | **PASS** |
+| A PCB with defects | **FAIL**, with boxes, severity, location and an instruction |
+| No PCB (empty stand, hand, paper...) | **No PCB in view**: neither PASS nor FAIL; defect search and Llama skipped |
 
-## Repository Structure
+## Results
 
-- `dashboard.py` - Streamlit web interface for the operator. Supports live camera capture or image upload, displays detection overlays, advisory text, and hardware telemetry.
-- `vision.py` - Core vision pipeline. Handles camera capture, image tiling, YOLO inference, and bounding box merging.
-- `llm_engine.py` - Severity rules, location assignment, prompt construction, ExecuTorch runner interface, and response validation.
-- `llama_runner.py` - Standalone ExecuTorch runner script for Llama 3.2 1B Instruct.
-- `hardware_logger.py` - SQLite logger for inspection history and hardware telemetry (CPU, RAM, core temperature).
-- `pipeline.py` - Minimal command-line test script for single image inspection.
-- `train_yolo.py` - YOLO training and ONNX export script.
-- `download_dataset.py` - Dataset download script using Roboflow.
-- `pcb_gate/` - Binary classifier (pcb vs not_pcb) used as an input check before running defect inspection.
-- `PCB-Defects-Detection-1/` - Peking University PCB dataset files, including sample test images.
-- `PROJECT_REPORT.md` - Final project report detailing methodology, hardware utilization, and results.
+| | |
+|---|---|
+| Defect detector (1,806 test tiles from 72 held-out photos) | precision 0.951, recall 0.983, **mAP50 0.977**, mAP50-95 0.564 |
+| PCB check (359 held-out downloaded and generated pictures) | 359 / 359 correct |
+| Defect search on the Pi 5, one 4056 × 3040 camera photo (48 tiles) | about 7 to 8 s |
+| Llama 3.2 1B on the Pi 5 CPU (ExecuTorch 1.6.0, XNNPACK, 8da4w) | 13 to 17 tokens/s, peak memory about 1.27 GB, model file 802.5 MB |
 
-## Setup and Installation
+`benchmark.py` repeats the speed and memory measurements on your own pictures.
 
-### Prerequisites
+## Hardware
 
-- Python 3.10+ (tested on Apple Silicon and Raspberry Pi 5)
-- Standard USB webcam or camera module
+- Raspberry Pi 5, 8 GB
+- Arducam IMX477 12.3 MP camera with motorised focus (autofocus by `focus.py`), on the Pi 5 camera port
+- Optional: any USB webcam (used automatically if no ribbon camera is found)
 
-### Installation
+## Repository
+
+| File | What it does |
+|---|---|
+| `dashboard.py` | Streamlit operator dashboard: capture or upload, verdict, boxes, findings, instruction, telemetry |
+| `vision.py` | PCB check (`pcb_gate.onnx`), tiled defect search (`yolo_pcb.onnx`), duplicate merging |
+| `camera.py` | Ribbon camera (Picamera2) with autofocus at start, or a USB webcam |
+| `focus.py` | Focus motor control over I2C and contrast autofocus; also a command-line tool |
+| `llm_engine.py` | Severity and location rules, prompt, instruction check, rule-based fallback |
+| `llama_runner.py` | Runs Llama 3.2 1B with ExecuTorch (in the separate `et_env` environment) |
+| `hardware_logger.py` | SQLite log of inspections with CPU, memory and temperature |
+| `pipeline.py` | Inspect one picture from the command line |
+| `benchmark.py` | Measure speed, memory and temperature for the report |
+| `collect_photos.py` | Take training photos with the station camera |
+| `download_dataset.py` | Download the PKU PCB dataset from Kaggle |
+| `training/` | Colab notebooks: defect detector (tiled), PCB check, Llama export. `early_roboflow_attempt/` is the first, unsuccessful approach |
+| `pcb_gate/gate_metrics.txt` | Test scores of the PCB check |
+| `no-pcb-check-instructions.md` | Step-by-step guide for training and testing the PCB check |
+
+The model files (`*.onnx`, `*.pte`) are not stored in Git because of their size; the notebooks in `training/` produce them.
+
+## Setup on the Raspberry Pi
 
 ```bash
+sudo apt install python3-picamera2
 git clone https://github.com/Satyakam-Mishra/BharatAIHackathon.git
 cd BharatAIHackathon
 
-python3 -m venv pcb_env
+# Vision and dashboard environment
+python3 -m venv --system-site-packages pcb_env
 source pcb_env/bin/activate
-
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
-pip install streamlit pandas psutil
+
+# Llama environment (separate)
+python3 -m venv ~/et_env
+~/et_env/bin/pip install -r requirements-llm.txt
 ```
 
-## Running the Application
+Model files to copy onto the Pi:
 
-### 1. Operator Dashboard
+- `yolo_pcb.onnx` and `pcb_gate.onnx` into this folder
+- `llama3_2_1b_main.pte` and `tokenizer.model` into `~/llama/`
 
-To start the inspection dashboard:
+For the Arducam IMX477, add `dtoverlay=imx477` and set `camera_auto_detect=0` in `/boot/firmware/config.txt`, then reboot.
+
+## Running
 
 ```bash
-streamlit run dashboard.py
+source pcb_env/bin/activate
+streamlit run dashboard.py --server.address 0.0.0.0 --server.headless true
 ```
 
-Open the local URL shown in your terminal (usually http://localhost:8501). From there you can:
-- Select input source: camera or uploaded image (sample test images are available in `PCB-Defects-Detection-1/test/images/`).
-- Adjust zoom if the camera is positioned far from the board.
-- View PASS/FAIL status, annotated boxes, severity table, operator advice, and hardware metrics.
+Open `http://pcb-pi.local:8501` from a browser on the same network.
 
-### 2. Standalone Tests
+Other checks:
 
-- Test the rule engine and advisory output directly:
-  ```bash
-  python3 llm_engine.py
-  ```
+```bash
+python3 pipeline.py path/to/board.jpg          # inspect one picture
+python3 benchmark.py path/to/test_pictures     # speed, memory, temperature
+python3 llm_engine.py                          # rules and advisory on four test cases
+~/et_env/bin/python llama_runner.py --test     # Llama on its own
+```
 
-- Test the ExecuTorch Llama runner (requires the ExecuTorch environment on the Pi):
-  ```bash
-  ~/et_env/bin/python llama_runner.py --test
-  ```
+## Data and licences
 
-- Test single-image vision detection:
-  ```bash
-  python3 pipeline.py
-  ```
+- Dataset: Peking University PCB defect dataset (Kaggle: `akhatova/pcb-defects`)
+- Ultralytics YOLOv8 is licensed under AGPL-3.0; this repository is therefore released under the same licence (see `LICENSE`)
+- Llama 3.2 is used under the Llama 3.2 Community Licence
 
-## Hardware and Performance Summary
+## Team
 
-- **Target Device:** Raspberry Pi 5 (Quad-Core Cortex-A76 @ 2.4 GHz)
-- **Vision Latency:** ~85 ms per tile (~500 ms for a typical 6-tile full board inspection)
-- **Verdict Speed:** Operator receives PASS/FAIL verdict in under 600 ms
-- **LLM Speed:** ~11 tokens/second on Pi 5 CPU via ExecuTorch
-- **Memory Usage:** ~880 MB for the quantized INT4 Llama model, ~280 MB for the vision and UI processes
-- **Operating Mode:** Fully offline, zero cloud reliance
-
-## Dataset
-
-Peking University (PKU) Market PCB Defect Dataset (via Roboflow).
-
-## Contributors
-
-- Satyakam Mishra
-- Aryan Lahoti
-- Kavya Soni
-
-**Project Guide:** Adithya Kumar
+Satyakam Mishra, Aryan Lahoti, Kavya Soni. Guide: Adithya Kumar. IIT Gandhinagar.

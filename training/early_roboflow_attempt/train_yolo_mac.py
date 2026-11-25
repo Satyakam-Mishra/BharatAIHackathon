@@ -1,3 +1,7 @@
+"""Early attempt (not used for the final model): YOLOv8n trained on the Roboflow images on a Mac.
+
+The model running on the Pi comes from ../train_pcb_yolo_tiles_colab.ipynb instead (tiled training).
+"""
 from ultralytics import YOLO
 
 # 1. Load pretrained nano model
