@@ -1,0 +1,4 @@
+# Llama environment (et_env), separate from pcb_env
+#   python3 -m venv ~/et_env && ~/et_env/bin/pip install -r requirements-llm.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+executorch==1.6.0

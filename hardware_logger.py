@@ -39,13 +39,20 @@ def get_hardware_metrics():
         
     return {"cpu_percent": cpu_usage, "ram_percent": ram_usage, "temp_c": temp}
 
-def log_inspection(defects, advice):
-    """Logs a single PCB inspection result to SQLite."""
+def log_inspection(defects, advice, label=None):
+    """Logs a single PCB inspection result to SQLite.
+
+    label: optional text for the defect_types column instead of the defect names,
+           for example "No PCB" when the picture did not show a board.
+    """
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    defect_names = ", ".join([d["defect"] for d in defects]) if defects else "Nominal"
-    max_conf = max([d["confidence"] for d in defects]) if defects else 1.0
+    if label is not None:
+        defect_names, max_conf = label, None
+    else:
+        defect_names = ", ".join([d["defect"] for d in defects]) if defects else "Nominal"
+        max_conf = max([d["confidence"] for d in defects]) if defects else 1.0
     hw = get_hardware_metrics()
     
     cursor.execute("""
